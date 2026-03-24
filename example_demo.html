@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SINEplot — Interactive Demo</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f12; color: #e8e6e0; min-height: 100vh; padding: 2rem 1rem; }
+h1 { font-size: 1.4rem; font-weight: 500; letter-spacing: -0.02em; margin-bottom: 0.25rem; color: #f0ece4; }
+.subtitle { font-size: 0.8rem; color: #6b6860; margin-bottom: 1.5rem; }
+#stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 1rem; max-width: 860px; }
+.stat { background: #1a1a1f; border: 0.5px solid #2a2a30; border-radius: 10px; padding: 10px 14px; }
+.stat-label { font-size: 10px; color: #6b6860; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px; }
+.stat-val { font-size: 22px; font-weight: 500; color: #f0ece4; }
+#toolbar { display: flex; gap: 6px; margin-bottom: 0.75rem; flex-wrap: wrap; }
+.mode-btn { font-size: 12px; padding: 5px 14px; border: 0.5px solid #3a3a42; border-radius: 8px; background: transparent; cursor: pointer; color: #9b9890; transition: all 0.15s; }
+.mode-btn:hover { border-color: #5a5a65; color: #d0cec8; }
+.mode-btn.active { background: #f0ece4; color: #0f0f12; border-color: transparent; font-weight: 500; }
+#canvas-wrap { position: relative; width: 100%; max-width: 860px; height: 480px; border: 0.5px solid #2a2a30; border-radius: 14px; overflow: hidden; background: #14141a; }
+canvas { display: block; width: 100%; height: 100%; }
+#tooltip { position: absolute; pointer-events: none; opacity: 0; background: #1e1e26; border: 0.5px solid #3a3a44; border-radius: 10px; padding: 10px 14px; font-size: 12px; line-height: 1.7; color: #d0cec8; min-width: 175px; transition: opacity 0.1s; }
+#legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; font-size: 12px; color: #6b6860; align-items: center; max-width: 860px; }
+.leg-item { display: flex; align-items: center; gap: 5px; }
+.leg-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.leg-diamond { width: 9px; height: 9px; transform: rotate(45deg); flex-shrink: 0; border-radius: 1px; }
+#slider-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 12px; color: #6b6860; max-width: 860px; }
+#slider-row input[type=range] { flex: 1; max-width: 130px; accent-color: #888; }
+.mode-desc { font-size: 11px; color: #5a5a65; margin-bottom: 0.5rem; max-width: 860px; min-height: 1.4em; }
+</style>
+</head>
+<body>
+
+<h1>SINEplot</h1>
+<p class="subtitle">Interactive 2D visualizer for SINE transposon subfamily classification · synthetic demo data</p>
+
+<div id="stats-row">
+  <div class="stat"><div class="stat-label">SINE copies</div><div class="stat-val" id="s-total">—</div></div>
+  <div class="stat"><div class="stat-label">Subfamilies</div><div class="stat-val">3</div></div>
+  <div class="stat"><div class="stat-label">Clear assignments</div><div class="stat-val" id="s-solid">—</div></div>
+  <div class="stat"><div class="stat-label">Ambiguous</div><div class="stat-val" id="s-amb">—</div></div>
+</div>
+
+<div id="toolbar">
+  <button class="mode-btn active" onclick="setMode('subfamily')">Subfamily mode</button>
+  <button class="mode-btn" onclick="setMode('ternary')">Ternary mode</button>
+  <button class="mode-btn" onclick="setMode('conflict')">Conflict mode</button>
+</div>
+<p class="mode-desc" id="mode-desc">Color = assigned subfamily �� opacity = confidence (best bitscore / self-score)</p>
+
+<div id="canvas-wrap">
+  <canvas id="c"></canvas>
+  <div id="tooltip"></div>
+</div>
+
+<div id="slider-row">
+  <span>Dot size</span>
+  <input type="range" min="2" max="9" value="4" step="1" id="sz" oninput="dotR=+this.value;document.getElementById('sz-out').textContent=dotR;draw()">
+  <span id="sz-out">4</span>
+</div>
+
+<div id="legend"></div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const tip = document.getElementById('tooltip');
+let mode = 'subfamily';
+let dotR = 4;
+
+const SUBFAMS = [
+  { name: 'dD', cx: 0.22, cy: 0.72, hex: '#d05a2e' },
+  { name: 'dE', cx: 0.50, cy: 0.16, hex: '#3a8fd4' },
+  { name: 'dF', cx: 0.78, cy: 0.72, hex: '#2aad80' },
+];
+
+const MODE_DESCS = {
+  subfamily: 'Color = assigned subfamily · opacity = confidence (best bitscore / self-score)',
+  ternary:   'RGB blend: red = dD affinity · blue = dE affinity · green = dF affinity',
+  conflict:  'Circle = solid (&lt;0.50) · Diamond = moderate (0.50–0.85) · Star = ambiguous (≥0.85 conflict ratio)'
+};
+
+function rng(seed) {
+  let s = seed;
+  return () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+}
+const rand = rng(42);
+const rand2 = rng(99);
+
+function gauss(r, mu, sd) {
+  const u = r() + 1e-9, v = r();
+  return mu + sd * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+const points = [];
+const NPER = [640, 510, 480];
+const NAMES = ['dD','dE','dF'];
+
+SUBFAMS.forEach((sf, si) => {
+  for (let i = 0; i < NPER[si]; i++) {
+    const cx = Math.max(0.02, Math.min(0.98, gauss(rand, sf.cx, 0.078)));
+    const cy = Math.max(0.02, Math.min(0.98, gauss(rand, sf.cy, 0.078)));
+    const scores = SUBFAMS.map((t) => {
+      const dx = cx - t.cx, dy = cy - t.cy;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      return Math.max(0, 200 * Math.exp(-dist * 4.5) * (0.55 + 0.45*rand()));
+    });
+    const mx = Math.max(...scores);
+    const best = scores.indexOf(mx);
+    const sorted = [...scores].sort((a,b) => b - a);
+    const conflict = sorted[0] > 0 ? sorted[1]/sorted[0] : 0;
+    const conf = mx / 195;
+    const tier = conflict < 0.5 ? 'solid' : conflict < 0.85 ? 'moderate' : 'ambiguous';
+    points.push({
+      x: cx, y: cy, scores, best,
+      conflict: +conflict.toFixed(3),
+      conf: +Math.min(1, conf).toFixed(3),
+      tier,
+      id: `${NAMES[si]}_locus_${String(i+1).padStart(4,'0')}`
+    });
+  }
+});
+
+const solid = points.filter(p => p.tier === 'solid').length;
+const amb   = points.filter(p => p.tier === 'ambiguous').length;
+document.getElementById('s-total').textContent = points.length.toLocaleString();
+document.getElementById('s-solid').textContent = solid.toLocaleString();
+document.getElementById('s-amb').textContent   = amb.toLocaleString();
+
+function resize() {
+  const wrap = document.getElementById('canvas-wrap');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = wrap.clientWidth  * dpr;
+  canvas.height = wrap.clientHeight * dpr;
+  canvas.style.width  = wrap.clientWidth  + 'px';
+  canvas.style.height = wrap.clientHeight + 'px';
+  ctx.scale(dpr, dpr);
+  draw();
+}
+
+function toScreen(nx, ny) {
+  const w = canvas.width  / (window.devicePixelRatio || 1);
+  const h = canvas.height / (window.devicePixelRatio || 1);
+  const pad = 44;
+  return [pad + nx * (w - 2*pad), pad + ny * (h - 2*pad)];
+}
+
+function drawStar(cx, cy, r, pts) {
+  pts = pts || 5;
+  ctx.beginPath();
+  for (let i = 0; i < pts*2; i++) {
+    const a = (Math.PI / pts) * i - Math.PI/2;
+    const rad = (i % 2 === 0) ? r : r * 0.42;
+    if (i === 0) ctx.moveTo(cx + rad*Math.cos(a), cy + rad*Math.sin(a));
+    else         ctx.lineTo(cx + rad*Math.cos(a), cy + rad*Math.sin(a));
+  }
+  ctx.closePath();
+}
+
+function drawDiamond(cx, cy, r) {
+  ctx.beginPath();
+  ctx.moveTo(cx,       cy - r*1.4);
+  ctx.lineTo(cx + r*1.1, cy);
+  ctx.lineTo(cx,       cy + r*1.4);
+  ctx.lineTo(cx - r*1.1, cy);
+  ctx.closePath();
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.width  / dpr;
+  const h = canvas.height / dpr;
+  ctx.clearRect(0, 0, w, h);
+
+  const drawOrder = [...points].sort(() => rand2() - 0.5);
+
+  drawOrder.forEach(p => {
+    const [sx, sy] = toScreen(p.x, p.y);
+    let fill, alpha = 1;
+
+    if (mode === 'subfamily') {
+      fill  = SUBFAMS[p.best].hex;
+      alpha = 0.30 + 0.70 * p.conf;
+    } else if (mode === 'ternary') {
+      const sc  = p.scores;
+      const tot = (sc[0]+sc[1]+sc[2]) || 1;
+      const r   = Math.round(sc[0]/tot * 220);
+      const g   = Math.round(sc[2]/tot * 200);
+      const b   = Math.round(sc[1]/tot * 220);
+      fill  = `rgb(${r},${g},${b})`;
+      alpha = 0.85;
+    } else {
+      if      (p.tier === 'solid')    { fill = '#4a8f18'; alpha = 0.72; }
+      else if (p.tier === 'moderate') { fill = '#c27c18'; alpha = 0.85; }
+      else                            { fill = '#c03030'; alpha = 0.92; }
+    }
+
+    ctx.globalAlpha = alpha;
+
+    if (mode === 'conflict' && p.tier === 'ambiguous') {
+      drawStar(sx, sy, dotR + 2.5);
+    } else if (mode === 'conflict' && p.tier === 'moderate') {
+      drawDiamond(sx, sy, dotR + 1);
+    } else {
+      ctx.beginPath();
+      ctx.arc(sx, sy, dotR, 0, Math.PI*2);
+    }
+
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  });
+
+  SUBFAMS.forEach(sf => {
+    const [sx, sy] = toScreen(sf.cx, sf.cy);
+    ctx.beginPath();
+    ctx.arc(sx, sy, 18, 0, Math.PI*2);
+    ctx.fillStyle = sf.hex;
+    ctx.globalAlpha = 0.12;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 18, 0, Math.PI*2);
+    ctx.strokeStyle = sf.hex;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = sf.hex;
+    ctx.font = '500 12px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(sf.name, sx, sy);
+  });
+
+  updateLegend();
+}
+
+function updateLegend() {
+  const leg = document.getElementById('legend');
+  if (mode === 'subfamily') {
+    leg.innerHTML = SUBFAMS.map(sf => {
+      const n = points.filter(p => p.best === SUBFAMS.indexOf(sf)).length;
+      return `<span class="leg-item"><span class="leg-dot" style="background:${sf.hex}"></span>${sf.name} — ${n} copies</span>`;
+    }).join('');
+  } else if (mode === 'ternary') {
+    leg.innerHTML = `
+      <span class="leg-item"><span class="leg-dot" style="background:#d05a2e"></span>dD (red)</span>
+      <span class="leg-item"><span class="leg-dot" style="background:#3a8fd4"></span>dE (blue)</span>
+      <span class="leg-item"><span class="leg-dot" style="background:#2aad80"></span>dF (green)</span>
+      <span style="color:#4a4a52">· mixed = intermediate affinity</span>`;
+  } else {
+    const s = points.filter(p=>p.tier==='solid').length;
+    const m = points.filter(p=>p.tier==='moderate').length;
+    const a = points.filter(p=>p.tier==='ambiguous').length;
+    leg.innerHTML = `
+      <span class="leg-item"><span class="leg-dot" style="background:#4a8f18"></span>Solid &lt;0.50 — ${s}</span>
+      <span class="leg-item"><span class="leg-diamond" style="background:#c27c18"></span>Moderate 0.50–0.85 — ${m}</span>
+      <span class="leg-item"><span style="font-size:14px;color:#c03030">&#9733;</span>Ambiguous ≥0.85 — ${a}</span>`;
+  }
+}
+
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active', b.textContent.toLowerCase().startsWith(m));
+  });
+  document.getElementById('mode-desc').innerHTML = MODE_DESCS[m];
+  draw();
+}
+
+const wrap = document.getElementById('canvas-wrap');
+wrap.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  let closest = null, minD = 18;
+  points.forEach(p => {
+    const [sx, sy] = toScreen(p.x, p.y);
+    const d = Math.sqrt((sx-mx)**2 + (sy-my)**2);
+    if (d < minD) { minD = d; closest = p; }
+  });
+  if (closest) {
+    const sf = SUBFAMS[closest.best];
+    const runnerIdx = closest.scores.reduce((best, s, i) => (i !== closest.best && s > closest.scores[best]) ? i : best,
+      closest.best === 0 ? 1 : 0);
+    const runner = SUBFAMS[runnerIdx];
+    const left = mx + 16 < wrap.clientWidth - 190 ? mx + 16 : mx - 185;
+    const top  = Math.max(0, Math.min(my - 10, wrap.clientHeight - 160));
+    tip.style.opacity = '1';
+    tip.style.left = left + 'px';
+    tip.style.top  = top  + 'px';
+    tip.innerHTML = `<span style="color:#f0ece4;font-weight:500">${closest.id}</span><br>
+      Assignment: <span style="color:${sf.hex};font-weight:500">${sf.name}</span><br>
+      Confidence: ${(closest.conf*100).toFixed(1)}%<br>
+      Conflict ratio: ${closest.conflict}<br>
+      Tier: <span style="color:${closest.tier==='solid'?'#4a8f18':closest.tier==='moderate'?'#c27c18':'#c03030'}">${closest.tier}</span><br>
+      Runner-up: ${runner.name}<br>
+      <span style="color:#4a4a55;font-size:11px">dD ${closest.scores[0].toFixed(1)} · dE ${closest.scores[1].toFixed(1)} · dF ${closest.scores[2].toFixed(1)}</span>`;
+  } else {
+    tip.style.opacity = '0';
+  }
+});
+wrap.addEventListener('mouseleave', () => { tip.style.opacity = '0'; });
+window.addEventListener('resize', () => { resize(); });
+resize();
+</script>
+</body>
+</html>
