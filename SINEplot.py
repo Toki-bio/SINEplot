@@ -155,6 +155,15 @@ def position_sine_absolute_weighted(scores, sf_positions):
     
     return (x, y)
 
+def calculate_conflict_ratio(scores):
+    """Ratio of 2nd-best to 1st-best bitscore. 0 = unambiguous, ~1 = maximally ambiguous."""
+    sorted_scores = sorted(scores.values(), reverse=True)
+    if len(sorted_scores) < 2 or sorted_scores[0] == 0:
+        return 0.0
+    if sorted_scores[1] == 0:
+        return 0.0
+    return sorted_scores[1] / sorted_scores[0]
+
 def avoid_label_overlap(positions, subfamilies, min_distance=2.5):
     label_positions = {}
     centroid = np.mean(list(positions.values()), axis=0)
@@ -305,7 +314,11 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
     else:
         sf_positions = get_subfamily_positions_geometric(subfamilies)
 
-    base_colors = ['#FF4444', '#4444FF', '#44FF44', '#FF44FF', '#FFAA44']
+    base_colors = [
+        '#FF4444', '#4444FF', '#44FF44', '#FF44FF', '#FFAA44',
+        '#44FFFF', '#FF8844', '#8844FF', '#44FF88', '#FF4488',
+        '#88FF44', '#4488FF'
+    ]
 
     print("\nBuilding bitscore lookup...")
     bitscore_lookup = {}
@@ -333,6 +346,10 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
             sf_idx = -1
             intensity = 0
 
+        conflict = calculate_conflict_ratio(scores)
+        sorted_sf = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        second_sf = sorted_sf[1][0] if len(sorted_sf) > 1 and sorted_sf[1][1] > 0 else None
+
         sine_data.append({
             'id': sine,
             'x': pos[0],
@@ -340,7 +357,10 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
             'sf': dominant_sf,
             'sf_idx': sf_idx,
             'intensity': intensity,
-            'scores': scores
+            'scores': scores,
+            'conflict': conflict,
+            'second_sf': second_sf,
+            'stability': 'Ambiguous' if conflict >= 0.85 else ('Moderate' if conflict >= 0.5 else 'Solid')
         })
     print(f"\n  Positioned {len(sine_data)} sequences")
 
@@ -382,6 +402,9 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
             text_lines = [f"<b>{s['id']}</b><br>"]
             text_lines.append(f"<b>Assigned to: {s['sf']}</b><br>")
             text_lines.append(f"<b>Confidence: {s['intensity']*100:.1f}%</b><br>")
+            text_lines.append(f"<b>Conflict: {s['conflict']:.2f}</b> ({s['stability']})<br>")
+            if s['second_sf']:
+                text_lines.append(f"<b>Runner-up: {s['second_sf']}</b><br>")
             text_lines.append("<br><b>Bitscores (raw / %):</b><br>")
             for sub_sf in subfamilies:
                 score = s['scores'][sub_sf]
@@ -443,6 +466,9 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
         ternary_colors.append(rgba)
         text_lines = [f"<b>{s['id']}</b><br>"]
         text_lines.append(f"<b>Best match: {s['sf']}</b><br>")
+        text_lines.append(f"<b>Conflict: {s['conflict']:.2f}</b> ({s['stability']})<br>")
+        if s['second_sf']:
+            text_lines.append(f"<b>Runner-up: {s['second_sf']}</b><br>")
         text_lines.append("<br><b>Relative contribution:</b><br>")
         for sf in available_subfamilies:
             rgb_val = sf_to_rgb.get(sf, (128,128,128))
@@ -474,6 +500,53 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
         showlegend=False
     ))
     ternary_trace_index = len(fig.data) - 1
+
+    # --- Conflict Mode traces ---
+    conflict_tiers = [
+        ('Solid', lambda s: s['stability'] == 'Solid', '#2ecc71', 'circle'),
+        ('Moderate', lambda s: s['stability'] == 'Moderate', '#f39c12', 'diamond'),
+        ('Ambiguous', lambda s: s['stability'] == 'Ambiguous', '#e74c3c', 'star'),
+    ]
+    conflict_trace_indices = []
+    for tier_name, tier_filter, tier_color, tier_symbol in conflict_tiers:
+        tier_sines = [s for s in sine_data if tier_filter(s)]
+        if not tier_sines:
+            # Empty placeholder trace so indices stay consistent
+            fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+                name=f'{tier_name} (0)', visible=False, showlegend=True,
+                marker=dict(size=10, color=tier_color, symbol=tier_symbol)))
+            conflict_trace_indices.append(len(fig.data) - 1)
+            continue
+        tier_x = [s['x'] for s in tier_sines]
+        tier_y = [s['y'] for s in tier_sines]
+        tier_hover = []
+        for s in tier_sines:
+            lines = [f"<b>{s['id']}</b><br>",
+                     f"<b>Assigned to: {s['sf']}</b><br>",
+                     f"<b>Conflict: {s['conflict']:.2f}</b> ({s['stability']})<br>"]
+            if s['second_sf']:
+                lines.append(f"<b>Runner-up: {s['second_sf']}</b><br>")
+            lines.append(f"<b>Confidence: {s['intensity']*100:.1f}%</b><br>")
+            lines.append("<br><b>Bitscores:</b><br>")
+            for sf in subfamilies:
+                score = s['scores'][sf]
+                pct = (score / max_scores[sf]) * 100 if max_scores[sf] > 0 else 0
+                lines.append(f"  {sf}: <b>{score:.1f}</b> bits ({pct:.1f}%)<br>")
+            tier_hover.append(''.join(lines))
+        trace_type = go.Scattergl if len(sine_data) > 300 else go.Scatter
+        fig.add_trace(trace_type(
+            x=tier_x, y=tier_y, mode='markers',
+            name=f'{tier_name} ({len(tier_sines)})',
+            marker=dict(
+                size=10 if len(sine_data) > 300 else 12,
+                color=tier_color, symbol=tier_symbol,
+                line=dict(width=0.8, color='rgba(0,0,0,0.4)')
+            ),
+            hovertext=tier_hover, hoverinfo='text',
+            text=[s['id'] for s in tier_sines],
+            visible=False
+        ))
+        conflict_trace_indices.append(len(fig.data) - 1)
 
     label_positions = avoid_label_overlap(sf_positions, subfamilies)
     for i, sf in enumerate(subfamilies):
@@ -508,7 +581,9 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
                'Click legend to toggle<br>' +
                '"Reset Legend" restores all</sub><br>' +
                '<sub><b>Subfamily Mode:</b><br>Color = assignment<br>Opacity = confidence</sub><br>' +
-               '<sub><b>Ternary Mode:</b><br>RGB blend of top 3</sub>')
+               '<sub><b>Ternary Mode:</b><br>RGB blend of top 3</sub><br>' +
+               '<sub><b>Conflict Mode:</b><br>Assignment ambiguity<br>' +
+               'Green=solid, Orange=moderate, Red=ambiguous</sub>')
     if len(sine_data) < len(full_sine_data):
         subtitle += f'<br><sub>Showing {len(sine_data)} of {len(full_sine_data)}</sub>'
 
@@ -591,6 +666,14 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
                             ],
                             label="Ternary Mode",
                             method="update"
+                        ),
+                        dict(
+                            args=[
+                                {"visible": [i in conflict_trace_indices or i >= total_traces - len(subfamilies)*2 for i in range(total_traces)]},
+                                {"xaxis.range": [x_min, x_max], "yaxis.range": [y_min, y_max]}
+                            ],
+                            label="Conflict Mode",
+                            method="update"
                         )
                     ],
                     pad={"r": 10, "t": 10},
@@ -634,7 +717,7 @@ def create_interactive_plot(df, mode='phylo', output='sine_interactive.html',
         default = 3
 
     num_subfamilies = len(subfamilies)
-    data_trace_indices = set(subfamily_trace_indices + [ternary_trace_index])
+    data_trace_indices = set(subfamily_trace_indices + [ternary_trace_index] + conflict_trace_indices)
     def create_size_list(base_size):
         size_list = []
         for i in range(len(fig.data)):
@@ -767,6 +850,20 @@ def print_stats(sine_data, subfamilies, max_scores):
     print("COMPREHENSIVE STATISTICS")
     print("="*60)
     total_sines = len(sine_data)
+
+    # Conflict distribution
+    if sine_data and 'conflict' in sine_data[0]:
+        conflicts = [s['conflict'] for s in sine_data]
+        n_solid = sum(1 for c in conflicts if c < 0.5)
+        n_moderate = sum(1 for c in conflicts if 0.5 <= c < 0.85)
+        n_ambiguous = sum(1 for c in conflicts if c >= 0.85)
+        print(f"\nAssignment Conflict Distribution:")
+        print(f"  Solid      (ratio < 0.50): {n_solid:>6} ({n_solid/total_sines*100:.1f}%)")
+        print(f"  Moderate (0.50 -  0.85): {n_moderate:>6} ({n_moderate/total_sines*100:.1f}%)")
+        print(f"  Ambiguous    (>= 0.85): {n_ambiguous:>6} ({n_ambiguous/total_sines*100:.1f}%)")
+        print(f"  Mean conflict ratio:   {np.mean(conflicts):.3f}")
+        print(f"  Median conflict ratio: {np.median(conflicts):.3f}")
+
     for sf in subfamilies:
         sf_sines = [s for s in sine_data if s['sf'] == sf]
         print(f"\n{sf}: {len(sf_sines)} SINEs ({len(sf_sines)/total_sines*100:.1f}%)")
